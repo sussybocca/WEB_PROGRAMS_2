@@ -755,9 +755,8 @@ function validateSemantics(ast) {
         exitScope();
         break;
 
-      case 'Literal':
-      case 'Identifier':
-        break;
+case 'Literal':
+  break;
 
       default:
         console.warn('Unhandled node type in semantic analysis:', node.type);
