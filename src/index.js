@@ -1,9 +1,54 @@
 import { compileProgramBot, compileNetworkBots } from './compiler';
 
 // ----------------------------------------------------------------------
+//  Opcode definitions (copied from compiler for disassembly)
+// ----------------------------------------------------------------------
+const OP = {
+  PUSH_CONST:   0x01,
+  POP:          0x02,
+  LOAD_VAR:     0x03,
+  STORE_VAR:    0x04,
+  ADD:          0x05,
+  SUB:          0x06,
+  MUL:          0x07,
+  DIV:          0x08,
+  MOD:          0x09,
+  EQ:           0x0A,
+  NEQ:          0x0B,
+  LT:           0x0C,
+  GT:           0x0D,
+  LTE:          0x0E,
+  GTE:          0x0F,
+  AND:          0x10,
+  OR:           0x11,
+  JMP:          0x12,
+  JZ:           0x13,
+  EXEC_BLOCK:   0x14,
+  ENTER_FUNC:   0x20,
+  STORE_PARAM:  0x21,
+  RETURN:       0x22,
+  CALL:         0x23,
+  NEW_ARRAY:    0x24,
+  NEW_OBJECT:   0x25,
+  SET_PROP:     0x26,
+  GET_PROP:     0x27,
+  SET_PROP_COMPUTED: 0x28,
+  GET_PROP_COMPUTED: 0x29,
+  THROW:        0x2A,
+  CATCH:        0x2B,
+  FINALLY:      0x2C,
+  END_CATCH:    0x2D,
+  HALT:         0xFF,
+};
+
+// Reverse mapping for disassembly
+const OP_NAME = Object.fromEntries(
+  Object.entries(OP).map(([name, code]) => [code, name])
+);
+
+// ----------------------------------------------------------------------
 //  Global helpers
 // ----------------------------------------------------------------------
-
 function escapeHtml(unsafe) {
   return unsafe
     .replace(/&/g, '&amp;')
@@ -25,9 +70,7 @@ function bufferToHex(buffer) {
   return '\\x' + Buffer.from(buffer).toString('hex');
 }
 
-// Format hex for display: group in pairs and add line breaks every 32 bytes
 function formatHex(hexString) {
-  // Remove leading \x if present
   const hex = hexString.startsWith('\\x') ? hexString.slice(2) : hexString;
   const pairs = hex.match(/.{1,2}/g) || [];
   const lines = [];
@@ -38,9 +81,101 @@ function formatHex(hexString) {
 }
 
 // ----------------------------------------------------------------------
-//  Embedded UI components – modern, dark theme, with toast notifications
+//  Binary decompiler (server‑side)
 // ----------------------------------------------------------------------
+function disassembleBinary(hexInput) {
+  // Remove any whitespace and optional \x prefix
+  let clean = hexInput.replace(/\s+/g, '');
+  if (clean.startsWith('\\x')) clean = clean.slice(2);
+  if (clean.length % 2 !== 0) throw new Error('Invalid hex length');
+  
+  const bytes = [];
+  for (let i = 0; i < clean.length; i += 2) {
+    bytes.push(parseInt(clean.substr(i, 2), 16));
+  }
 
+  let pos = 0;
+  // Header (16 bytes)
+  if (bytes.length < 16) throw new Error('Binary too short');
+  const magic = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+  const entry = (bytes[4] << 24) | (bytes[5] << 16) | (bytes[6] << 8) | bytes[7];
+  const dataSize = (bytes[8] << 24) | (bytes[9] << 16) | (bytes[10] << 8) | bytes[11];
+  const codeSize = (bytes[12] << 24) | (bytes[13] << 16) | (bytes[14] << 8) | bytes[15];
+  pos = 16;
+
+  if (bytes.length < 16 + dataSize + codeSize) throw new Error('Binary size mismatch');
+
+  // Data section (constants)
+  const constants = [];
+  const dataEnd = pos + dataSize;
+  while (pos < dataEnd) {
+    const len = (bytes[pos] << 24) | (bytes[pos+1] << 16) | (bytes[pos+2] << 8) | bytes[pos+3];
+    pos += 4;
+    if (pos + len > dataEnd) throw new Error('Constant data truncated');
+    
+    let value;
+    if (len === 8) {
+      // Double (IEEE 754 little‑endian)
+      const buf = new ArrayBuffer(8);
+      const view = new DataView(buf);
+      for (let i = 0; i < 8; i++) view.setUint8(i, bytes[pos + i]);
+      value = view.getFloat64(0, true);
+      pos += 8;
+    } else if (len === 1 && bytes[pos] === 0) {
+      value = null;
+      pos += 1;
+    } else if (len === 1 && (bytes[pos] === 0 || bytes[pos] === 1)) {
+      value = bytes[pos] === 1;
+      pos += 1;
+    } else {
+      // String (UTF-8)
+      const strBytes = bytes.slice(pos, pos + len);
+      value = new TextDecoder().decode(new Uint8Array(strBytes));
+      pos += len;
+    }
+    constants.push(value);
+  }
+
+  // Code section
+  const code = bytes.slice(pos, pos + codeSize);
+  const disassembly = [];
+  let i = 0;
+  while (i < code.length) {
+    const op = code[i];
+    const mnemonic = OP_NAME[op] || `UNKNOWN_0x${op.toString(16).padStart(2,'0')}`;
+    let line = `${i.toString(16).padStart(4,'0')}: ${mnemonic}`;
+    i++;
+
+    if (op === 0x01 || op === 0x03 || op === 0x04 || op === 0x21 || op === 0x26 || op === 0x27) {
+      // 4‑byte constant index
+      if (i + 3 >= code.length) throw new Error('Truncated instruction');
+      const idx = (code[i] << 24) | (code[i+1] << 16) | (code[i+2] << 8) | code[i+3];
+      const constVal = constants[idx];
+      line += ` ${idx} (${JSON.stringify(constVal)})`;
+      i += 4;
+    } else if (op === 0x12 || op === 0x13) {
+      // 2‑byte jump offset (signed)
+      if (i + 1 >= code.length) throw new Error('Truncated jump');
+      let offset = (code[i] << 8) | code[i+1];
+      if (offset > 32767) offset -= 65536; // sign‑extend 16‑bit
+      line += ` ${offset} (→${(i+2 + offset).toString(16)})`;
+      i += 2;
+    } else if (op === 0x23 || op === 0x24) {
+      // 4‑byte argument count
+      if (i + 3 >= code.length) throw new Error('Truncated instruction');
+      const arg = (code[i] << 24) | (code[i+1] << 16) | (code[i+2] << 8) | code[i+3];
+      line += ` ${arg}`;
+      i += 4;
+    }
+    disassembly.push(line);
+  }
+
+  return { magic, entry, dataSize, codeSize, constants, disassembly };
+}
+
+// ----------------------------------------------------------------------
+//  HTML templates
+// ----------------------------------------------------------------------
 const LAYOUT_CSS = `
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -149,6 +284,13 @@ const LAYOUT_CSS = `
   @keyframes spin { to { transform: rotate(360deg); } }
   .button-group { display: flex; align-items: center; }
   pre code.hljs { background: transparent; padding: 1rem; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+  th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #30363d; }
+  th { color: #58a6ff; }
+  .opcode { color: #7ee787; }
+  .comment { color: #8b949e; font-style: italic; }
+  .addr { color: #79c0ff; }
+  .data { color: #ff7b72; }
 `;
 
 const TOAST_JS = `
@@ -188,6 +330,7 @@ const ROOT_HTML = `
         <div id="spinner" class="spinner" style="display:none;"></div>
       </div>
     </form>
+    <p style="margin-top: 2rem;"><a href="/decompile" class="btn-secondary btn">🔧 Decompile Binary</a></p>
   </div>
   <script>
     ${TOAST_JS}
@@ -309,7 +452,6 @@ function adminViewHTML(program) {
       const res = await fetch(window.location.href + '/binary');
       if (res.ok) {
         const hex = await res.text();
-        // Format nicely
         const formatted = formatHex(hex);
         binaryPanel.style.display = 'block';
         binaryPanel.textContent = formatted;
@@ -318,7 +460,6 @@ function adminViewHTML(program) {
       }
     }
 
-    // Format hex function (same as worker's but defined here)
     function formatHex(hexString) {
       const hex = hexString.startsWith('\\\\x') ? hexString.slice(2) : hexString;
       const pairs = hex.match(/.{1,2}/g) || [];
@@ -344,10 +485,7 @@ function adminViewHTML(program) {
         });
         if (res.ok) {
           showToast('Program saved and recompiled.');
-          // Refresh binary if visible
-          if (binaryPanel.style.display === 'block') {
-            await fetchBinary();
-          }
+          if (binaryPanel.style.display === 'block') await fetchBinary();
         } else {
           const err = await res.json();
           showToast('Error: ' + (err.details || err.error), 'error');
@@ -364,10 +502,113 @@ function adminViewHTML(program) {
 </html>`;
 }
 
+const DECOMPILE_FORM_HTML = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>WEB_PROGRAMS – Decompile Binary</title>
+  <style>${LAYOUT_CSS}</style>
+</head>
+<body>
+  <div id="toast" class="toast"></div>
+  <div class="card">
+    <h1>🔧 Decompile Binary</h1>
+    <p>Paste your compiled binary (hex format, with or without leading \\x) below.</p>
+    <form id="decompileForm" method="POST" action="/decompile">
+      <div class="editor-container">
+        <textarea name="binary" id="binary" rows="10" cols="80" placeholder="e.g. 50424f32000000008b01000010030000..." style="width:100%; background:#0d1117; color:#c9d1d9; border:none; padding:1.5rem; font-family: 'JetBrains Mono', monospace; line-height: 1.5;"></textarea>
+      </div>
+      <div class="button-group">
+        <button type="submit" class="btn" id="decompileBtn">Decompile</button>
+        <div id="spinner" class="spinner" style="display:none;"></div>
+      </div>
+    </form>
+  </div>
+  <script>
+    ${TOAST_JS}
+    document.getElementById('decompileForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById('decompileBtn');
+      const spinner = document.getElementById('spinner');
+      btn.disabled = true;
+      spinner.style.display = 'inline-block';
+
+      const binary = document.getElementById('binary').value;
+      try {
+        const res = await fetch('/decompile', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ binary })
+        });
+        if (res.ok) {
+          const html = await res.text();
+          document.open();
+          document.write(html);
+          document.close();
+        } else {
+          const text = await res.text();
+          showToast('Error: ' + text, 'error');
+          btn.disabled = false;
+          spinner.style.display = 'none';
+        }
+      } catch (err) {
+        showToast('Network error: ' + err.message, 'error');
+        btn.disabled = false;
+        spinner.style.display = 'none';
+      }
+    });
+  </script>
+</body>
+</html>
+`;
+
+function decompileResultHTML(hexInput) {
+  try {
+    const { magic, entry, dataSize, codeSize, constants, disassembly } = disassembleBinary(hexInput);
+    return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Decompiled Program</title>
+  <style>${LAYOUT_CSS}</style>
+</head>
+<body>
+  <div class="card">
+    <h1>🔍 Decompiled Program</h1>
+    <h2>Header</h2>
+    <table>
+      <tr><th>Magic</th><td>${escapeHtml(magic)}</td></tr>
+      <tr><th>Entry point</th><td>${entry}</td></tr>
+      <tr><th>Data size</th><td>${dataSize} bytes</td></tr>
+      <tr><th>Code size</th><td>${codeSize} bytes</td></tr>
+    </table>
+
+    <h2>Constants</h2>
+    <table>
+      <tr><th>Index</th><th>Value</th></tr>
+      ${constants.map((v, idx) => `<tr><td>${idx}</td><td>${escapeHtml(JSON.stringify(v))}</td></tr>`).join('')}
+    </table>
+
+    <h2>Disassembly</h2>
+    <pre class="binary-panel">${escapeHtml(disassembly.join('\n'))}</pre>
+
+    <p><a href="/decompile" class="btn">← Back</a></p>
+  </div>
+</body>
+</html>`;
+  } catch (err) {
+    return `<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>Error</title><style>${LAYOUT_CSS}</style></head>
+<body><div class="card"><h1>❌ Decompilation Failed</h1><p>${escapeHtml(err.message)}</p><p><a href="/decompile" class="btn">← Try Again</a></p></div></body>
+</html>`;
+  }
+}
+
 // ----------------------------------------------------------------------
 //  Worker
 // ----------------------------------------------------------------------
-
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -402,8 +643,9 @@ export default {
       return res;
     }
 
-    // -------------------- CREATE PROGRAM --------------------------------
+    // --- CREATE PROGRAM (unchanged) ---
     if (request.method === 'POST' && path === '/') {
+      // ... (unchanged, keep existing code)
       try {
         const body = await request.json().catch(() => ({}));
         const { source, type = 'program-bot' } = body;
@@ -434,8 +676,6 @@ export default {
         }
 
         const adminToken = generateAdminToken();
-
-        // Insert using column name "binary" (must be quoted in SQL, but in JSON it's fine)
         const insertRes = await supabaseRequest('programs', {
           method: 'POST',
           headers: { 'Prefer': 'return=representation' },
@@ -448,7 +688,6 @@ export default {
 
         const newRecord = await insertRes.json();
         const programId = newRecord[0].id;
-
         const baseUrl = `${url.protocol}//${url.host}`;
         const publicUrl = `${baseUrl}/${programId}`;
         const adminUrl = `${baseUrl}/admin/${adminToken}`;
@@ -464,7 +703,7 @@ export default {
       }
     }
 
-    // -------------------- PUBLIC VIEW ------------------------------------
+    // --- PUBLIC VIEW (unchanged) ---
     const publicMatch = path.match(/^\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
     if (request.method === 'GET' && publicMatch) {
       const id = publicMatch[1];
@@ -472,7 +711,6 @@ export default {
         const res = await supabaseRequest(`programs?id=eq.${id}&select=source_code,created_at,updated_at,admin_token`);
         const data = await res.json();
         if (!data.length) return new Response('Not found', { status: 404 });
-
         const program = data[0];
         const html = publicViewHTML(id, program);
         return new Response(html, { headers: { 'Content-Type': 'text/html' } });
@@ -481,7 +719,7 @@ export default {
       }
     }
 
-    // -------------------- ADMIN VIEW -------------------------------------
+    // --- ADMIN VIEW (unchanged) ---
     const adminMatch = path.match(/^\/admin\/([A-Za-z0-9_-]+)$/);
     if (request.method === 'GET' && adminMatch && !path.endsWith('/binary')) {
       const token = adminMatch[1];
@@ -489,7 +727,6 @@ export default {
         const res = await supabaseRequest(`programs?admin_token=eq.${token}&select=id,source_code,created_at,updated_at`);
         const data = await res.json();
         if (!data.length) return new Response('Not found', { status: 404 });
-
         const program = data[0];
         const html = adminViewHTML(program);
         return new Response(html, { headers: { 'Content-Type': 'text/html' } });
@@ -498,7 +735,7 @@ export default {
       }
     }
 
-    // -------------------- ADMIN UPDATE -----------------------------------
+    // --- ADMIN UPDATE (unchanged) ---
     if (request.method === 'POST' && adminMatch) {
       const token = adminMatch[1];
       try {
@@ -510,17 +747,15 @@ export default {
             headers: { 'Content-Type': 'application/json' },
           });
         }
-
         let binaryBuffer;
         try {
-          binaryBuffer = compileProgramBot(source); // assume program-bot
+          binaryBuffer = compileProgramBot(source);
         } catch (err) {
           return new Response(JSON.stringify({ error: 'Compilation failed', details: err.message }), {
             status: 400,
             headers: { 'Content-Type': 'application/json' },
           });
         }
-
         await supabaseRequest(`programs?admin_token=eq.${token}`, {
           method: 'PATCH',
           body: JSON.stringify({
@@ -529,7 +764,6 @@ export default {
             updated_at: new Date().toISOString(),
           }),
         });
-
         return new Response(JSON.stringify({ success: true }), {
           headers: { 'Content-Type': 'application/json' },
         });
@@ -541,22 +775,46 @@ export default {
       }
     }
 
-    // -------------------- GET BINARY HEX --------------------------------
+    // --- GET BINARY HEX (unchanged) ---
     if (request.method === 'GET' && path.match(/^\/admin\/[A-Za-z0-9_-]+\/binary$/)) {
       const token = path.split('/')[2];
       try {
         const res = await supabaseRequest(`programs?admin_token=eq.${token}&select=binary`);
         const data = await res.json();
         if (!data.length) return new Response('Not found', { status: 404 });
-
-        const binaryHex = data[0].binary; // stored as \x... string
+        const binaryHex = data[0].binary;
         return new Response(binaryHex, { headers: { 'Content-Type': 'text/plain' } });
       } catch (err) {
         return new Response('Error: ' + err.message, { status: 500 });
       }
     }
 
-    // -------------------- ROOT -------------------------------------------
+    // --- DECOMPILE FORM (GET) ---
+    if (request.method === 'GET' && path === '/decompile') {
+      return new Response(DECOMPILE_FORM_HTML, { headers: { 'Content-Type': 'text/html' } });
+    }
+
+    // --- DECOMPILE RESULT (POST) ---
+    if (request.method === 'POST' && path === '/decompile') {
+      const contentType = request.headers.get('content-type') || '';
+      let binaryHex = '';
+      if (contentType.includes('application/x-www-form-urlencoded')) {
+        const formData = await request.formData();
+        binaryHex = formData.get('binary') || '';
+      } else if (contentType.includes('application/json')) {
+        const body = await request.json().catch(() => ({}));
+        binaryHex = body.binary || '';
+      } else {
+        binaryHex = await request.text(); // fallback
+      }
+      if (!binaryHex.trim()) {
+        return new Response('Missing binary input', { status: 400 });
+      }
+      const html = decompileResultHTML(binaryHex);
+      return new Response(html, { headers: { 'Content-Type': 'text/html' } });
+    }
+
+    // --- ROOT (unchanged) ---
     if (request.method === 'GET' && path === '/') {
       return new Response(ROOT_HTML, { headers: { 'Content-Type': 'text/html' } });
     }
