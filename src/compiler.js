@@ -1122,7 +1122,7 @@ function generateNetworkBytecode(program) {
 
 function assembleBinary(magic, bytecode, constants) {
   // Convert constants to a binary data section
-  const dataSection = Buffer.alloc(4); // will grow dynamically
+  let dataSection = Buffer.alloc(4); // will grow dynamically
   let dataOffset = 0;
 
   // Write constants with length prefix
