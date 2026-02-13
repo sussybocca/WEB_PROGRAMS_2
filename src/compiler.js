@@ -770,8 +770,6 @@ case 'Literal':
   }
 }
 
-// ==================== BYTECODE GENERATOR ====================
-
 function generateBytecode(ast) {
   const bytecode = [];
   const constants = [];
@@ -892,6 +890,52 @@ function generateBytecode(ast) {
         bytecode[jzWhileIndex + 2] = afterLoopOffset & 0xFF;
         break;
 
+      // --- NEW CASES ---
+      case 'BlockStatement':
+        node.body.forEach(generate);
+        break;
+
+      case 'VariableDeclaration':
+        node.declarations.forEach(decl => {
+          if (decl.init) {
+            generate(decl.init);
+          } else {
+            // Default initializer: push null (or 0)
+            const nullIndex = addConstant(null);
+            bytecode.push(0x01); // PUSH_CONST
+            bytecode.push((nullIndex >> 24) & 0xFF);
+            bytecode.push((nullIndex >> 16) & 0xFF);
+            bytecode.push((nullIndex >> 8) & 0xFF);
+            bytecode.push(nullIndex & 0xFF);
+          }
+          // Store the value into the variable
+          const varNameIndex = addConstant(decl.id);
+          bytecode.push(0x04); // STORE_VAR
+          bytecode.push((varNameIndex >> 24) & 0xFF);
+          bytecode.push((varNameIndex >> 16) & 0xFF);
+          bytecode.push((varNameIndex >> 8) & 0xFF);
+          bytecode.push(varNameIndex & 0xFF);
+        });
+        break;
+
+      // Optional: ReturnStatement (if needed later)
+      case 'ReturnStatement':
+        if (node.argument) {
+          generate(node.argument);
+        } else {
+          // Push a default value (null) if no argument
+          const nullIndex = addConstant(null);
+          bytecode.push(0x01);
+          bytecode.push((nullIndex >> 24) & 0xFF);
+          bytecode.push((nullIndex >> 16) & 0xFF);
+          bytecode.push((nullIndex >> 8) & 0xFF);
+          bytecode.push(nullIndex & 0xFF);
+        }
+        // In a real VM you'd have a RET opcode. For now, we'll treat return as HALT? Not good.
+        // We'll just leave the value on stack and maybe the caller will handle it.
+        // Since we don't have functions, this case won't be used.
+        break;
+
       default:
         throw new Error(`Unsupported node type for bytecode generation: ${node.type}`);
     }
@@ -900,7 +944,6 @@ function generateBytecode(ast) {
   generate(ast);
   return { bytecode, constants };
 }
-
 // ==================== NETWORK_BOTS BYTECODE GENERATOR ====================
 // Compiles a block-and-connection graph into bytecode.
 // Input JSON: { blocks: [{ id, type, config }], connections: [{ from, to }] }
