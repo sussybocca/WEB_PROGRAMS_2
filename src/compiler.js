@@ -1,15 +1,88 @@
-// lib/compiler.js
-// Professional-grade compiler for Program_bot and Network_bots
-// No placeholders – fully functional for production.
+// ---------- Buffer Polyfill for Cloudflare Workers ----------
+(function() {
+  if (typeof globalThis.Buffer !== 'undefined') return;
 
-// ==================== PROGRAM_BOT COMPILER ====================
+  class Buffer extends Uint8Array {
+    constructor(arg, encoding) {
+      if (typeof arg === 'number') {
+        super(arg);
+      } else if (typeof arg === 'string') {
+        const encoder = new TextEncoder();
+        const bytes = encoder.encode(arg);
+        super(bytes);
+      } else if (arg instanceof Uint8Array) {
+        super(arg);
+      } else {
+        super(arg);
+      }
+    }
 
-// Binary format specification:
-// - Magic: 4 bytes "PBO1" (Program BOt version 1)
-// - Header: 12 bytes (entry point offset, data section size, code section size)
-// - Data section: concatenated constants with 4-byte length prefixes
-// - Code section: bytecode instructions
-// - Symbol table: For debugging (optional) – not included in production.
+    static alloc(size) {
+      return new Buffer(size);
+    }
+
+    static from(data, encoding) {
+      if (typeof data === 'string') {
+        return new Buffer(data, encoding);
+      }
+      if (Array.isArray(data)) {
+        return new Buffer(new Uint8Array(data));
+      }
+      if (data instanceof Uint8Array) {
+        return new Buffer(data);
+      }
+      return new Buffer(data);
+    }
+
+    static concat(list) {
+      let totalLength = list.reduce((acc, b) => acc + b.length, 0);
+      const result = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const buf of list) {
+        result.set(buf, offset);
+        offset += buf.length;
+      }
+      return new Buffer(result);
+    }
+
+    writeUInt32LE(value, offset) {
+      const dv = new DataView(this.buffer, this.byteOffset, this.byteLength);
+      dv.setUint32(offset, value, true);
+    }
+
+    writeDoubleLE(value, offset) {
+      const dv = new DataView(this.buffer, this.byteOffset, this.byteLength);
+      dv.setFloat64(offset, value, true);
+    }
+
+    write(string, offset, length, encoding) {
+      const encoder = new TextEncoder();
+      const bytes = encoder.encode(string);
+      for (let i = 0; i < bytes.length && i < length; i++) {
+        this[offset + i] = bytes[i];
+      }
+      return bytes.length;
+    }
+
+    slice(start, end) {
+      const sliced = super.slice(start, end);
+      return new Buffer(sliced);
+    }
+
+    toString(encoding) {
+      if (encoding === 'hex') {
+        return Array.from(this).map(b => b.toString(16).padStart(2, '0')).join('');
+      }
+      if (encoding === 'ascii' || encoding === 'utf8') {
+        const decoder = new TextDecoder(encoding);
+        return decoder.decode(this);
+      }
+      return super.toString();
+    }
+  }
+
+  globalThis.Buffer = Buffer;
+})();
 
 export function compileProgramBot(sourceCode) {
   // Step 1: Lexical analysis
