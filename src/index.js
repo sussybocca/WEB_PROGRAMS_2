@@ -566,35 +566,150 @@ const DECOMPILE_FORM_HTML = `
 function decompileResultHTML(hexInput) {
   try {
     const { magic, entry, dataSize, codeSize, constants, disassembly } = disassembleBinary(hexInput);
+    
+    // Build a pretty disassembly with coloured spans
+    const disasmHtml = disassembly.map(line => {
+      const escaped = escapeHtml(line);
+      // Colour address, mnemonic, and arguments
+      const coloured = escaped.replace(/^([0-9a-f]{4}):\s+([A-Z_]+)(.*)$/, 
+        '<span class="addr">$1:</span> <span class="opcode">$2</span><span class="data">$3</span>');
+      return `<div class="disasm-line">${coloured}</div>`;
+    }).join('');
+
     return `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
   <title>Decompiled Program</title>
   <style>${LAYOUT_CSS}</style>
+  <style>
+    /* Additional styles for a polished interface */
+    .disasm-line { 
+      font-family: 'JetBrains Mono', monospace; 
+      white-space: pre; 
+      padding: 2px 0;
+      border-bottom: 1px solid #2d2d2d;
+    }
+    .disasm-line:hover { background: #1e1e1e; }
+    .disasm-line .addr { color: #79c0ff; }
+    .disasm-line .opcode { color: #7ee787; font-weight: bold; }
+    .disasm-line .data { color: #ff7b72; }
+    .section-header {
+      cursor: pointer;
+      user-select: none;
+      padding: 0.5rem;
+      background: #1f1f1f;
+      border-radius: 8px;
+      margin: 1rem 0 0.5rem;
+      display: inline-block;
+    }
+    .section-header:hover { background: #2a2a2a; }
+    .section-header:after {
+      content: ' ▼';
+      font-size: 0.8rem;
+      color: #8b949e;
+    }
+    .section-header.collapsed:after { content: ' ▶'; }
+    .section-content { transition: max-height 0.2s ease-out; overflow: hidden; }
+    .section-content.collapsed { max-height: 0; }
+    .constants-table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #0d1117;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .constants-table th {
+      background: #1f1f1f;
+      color: #58a6ff;
+      font-weight: 500;
+      padding: 0.75rem;
+      text-align: left;
+    }
+    .constants-table td {
+      padding: 0.5rem 0.75rem;
+      border-bottom: 1px solid #2d2d2d;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .constants-table tr:last-child td { border-bottom: none; }
+    .constants-table .type-tag {
+      background: #2d2d2d;
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-size: 0.7rem;
+      color: #8b949e;
+      margin-left: 8px;
+    }
+  </style>
 </head>
 <body>
   <div class="card">
-    <h1>🔍 Decompiled Program</h1>
-    <h2>Header</h2>
-    <table>
-      <tr><th>Magic</th><td>${escapeHtml(magic)}</td></tr>
-      <tr><th>Entry point</th><td>${entry}</td></tr>
-      <tr><th>Data size</th><td>${dataSize} bytes</td></tr>
-      <tr><th>Code size</th><td>${codeSize} bytes</td></tr>
-    </table>
+    <h1 style="display: flex; align-items: center; gap: 1rem;">
+      <span>🔍 Program Disassembly</span>
+      <span style="font-size: 0.8rem; background: #1f1f1f; padding: 0.3rem 0.8rem; border-radius: 20px;">${magic}</span>
+    </h1>
 
-    <h2>Constants</h2>
-    <table>
-      <tr><th>Index</th><th>Value</th></tr>
-      ${constants.map((v, idx) => `<tr><td>${idx}</td><td>${escapeHtml(JSON.stringify(v))}</td></tr>`).join('')}
-    </table>
+    <!-- Header Section (always visible) -->
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin: 2rem 0;">
+      <div class="stat-card" style="background: #1f1f1f; border-radius: 12px; padding: 1rem;">
+        <div style="color: #8b949e; font-size: 0.8rem;">Entry Point</div>
+        <div style="font-size: 1.5rem; font-weight: bold; color: #79c0ff;">${entry}</div>
+      </div>
+      <div class="stat-card" style="background: #1f1f1f; border-radius: 12px; padding: 1rem;">
+        <div style="color: #8b949e; font-size: 0.8rem;">Data Size</div>
+        <div style="font-size: 1.5rem; font-weight: bold; color: #7ee787;">${dataSize} bytes</div>
+      </div>
+      <div class="stat-card" style="background: #1f1f1f; border-radius: 12px; padding: 1rem;">
+        <div style="color: #8b949e; font-size: 0.8rem;">Code Size</div>
+        <div style="font-size: 1.5rem; font-weight: bold; color: #ff7b72;">${codeSize} bytes</div>
+      </div>
+    </div>
 
-    <h2>Disassembly</h2>
-    <pre class="binary-panel">${escapeHtml(disassembly.join('\n'))}</pre>
+    <!-- Constants Section (collapsible) -->
+    <div class="section-header" onclick="toggleSection('constants')">Constants (${constants.length})</div>
+    <div id="constants" class="section-content">
+      <table class="constants-table">
+        <thead><tr><th>Index</th><th>Value</th><th>Type</th></tr></thead>
+        <tbody>
+          ${constants.map((v, idx) => {
+            let type = typeof v;
+            if (v === null) type = 'null';
+            else if (Array.isArray(v)) type = 'array';
+            else if (type === 'object') type = 'object';
+            const display = escapeHtml(JSON.stringify(v));
+            return `<tr><td>${idx}</td><td>${display}</td><td><span class="type-tag">${type}</span></td></tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
 
-    <p><a href="/decompile" class="btn">← Back</a></p>
+    <!-- Disassembly Section (collapsible, default open) -->
+    <div class="section-header" onclick="toggleSection('disasm')">Disassembly (${disassembly.length} instructions)</div>
+    <div id="disasm" class="section-content">
+      <div class="binary-panel" style="white-space: pre; font-family: 'JetBrains Mono', monospace; max-height: 500px; overflow-y: auto;">
+        ${disasmHtml}
+      </div>
+    </div>
+
+    <p style="margin-top: 2rem;"><a href="/decompile" class="btn">← Decompile Another</a></p>
   </div>
+
+  <script>
+    function toggleSection(id) {
+      const el = document.getElementById(id);
+      const header = event.currentTarget;
+      if (el.classList.contains('collapsed')) {
+        el.classList.remove('collapsed');
+        header.classList.remove('collapsed');
+      } else {
+        el.classList.add('collapsed');
+        header.classList.add('collapsed');
+      }
+    }
+    // Initially expand disassembly, collapse constants
+    document.getElementById('constants').classList.add('collapsed');
+    document.querySelector('.section-header').classList.add('collapsed');
+  </script>
 </body>
 </html>`;
   } catch (err) {
