@@ -10,11 +10,13 @@
     "build": "wrangler build"
   },
   "dependencies": {
-    "@cloudflare/ai": "^1.0.0",
-    "hono": "^3.11.0"
+    "@cloudflare/ai": "^1.2.2",
+    "base64-js": "^1.5.1",
+    "mustache": "^4.2.0",
+    "hono": "^3.12.12"
   },
   "devDependencies": {
-    "wrangler": "^3.0.0",
-    "@cloudflare/workers-types": "^4.0.0"
+    "wrangler": "^3.114.17",
+    "@cloudflare/workers-types": "^4.20250214.0"
   }
 }
