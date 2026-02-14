@@ -1,0 +1,20 @@
+{
+  "name": "cloudflare-ai-compiler",
+  "version": "1.0.0",
+  "description": "AI-powered compiler for web programs",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev --remote",
+    "start": "wrangler dev --remote",
+    "deploy": "wrangler deploy",
+    "build": "wrangler build"
+  },
+  "dependencies": {
+    "@cloudflare/ai": "^1.0.0",
+    "hono": "^3.11.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0",
+    "@cloudflare/workers-types": "^4.0.0"
+  }
+}
