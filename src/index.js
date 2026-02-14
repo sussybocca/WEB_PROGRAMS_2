@@ -1,5 +1,5 @@
 import { Ai } from '@cloudflare/ai';
-import { compileProgramBot, compileNetworkBots, transformCompiler, generateCodeFromPrompt } from './compiler';
+import { compileProgramBot, compileNetworkBots } from './compiler';
 
 // Opcode definitions (copied from compiler for disassembly)
 const OP = {
@@ -77,6 +77,96 @@ function formatHex(hexString) {
     lines.push(pairs.slice(i, i + 16).join(' '));
   }
   return lines.join('\n');
+}
+
+function disassembleBinary(hexInput) {
+  // Remove any whitespace and optional \x prefix
+  let clean = hexInput.replace(/\s+/g, '');
+  if (clean.startsWith('\\x')) clean = clean.slice(2);
+  if (clean.length % 2 !== 0) throw new Error('Invalid hex length');
+  
+  const bytes = [];
+  for (let i = 0; i < clean.length; i += 2) {
+    bytes.push(parseInt(clean.substr(i, 2), 16));
+  }
+
+  let pos = 0;
+  // Header (16 bytes)
+  if (bytes.length < 16) throw new Error('Binary too short');
+  const magic = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+  const entry = (bytes[4] << 24) | (bytes[5] << 16) | (bytes[6] << 8) | bytes[7];
+  const dataSize = (bytes[8] << 24) | (bytes[9] << 16) | (bytes[10] << 8) | bytes[11];
+  const codeSize = (bytes[12] << 24) | (bytes[13] << 16) | (bytes[14] << 8) | bytes[15];
+  pos = 16;
+
+  if (bytes.length < 16 + dataSize + codeSize) throw new Error('Binary size mismatch');
+
+  // Data section (constants)
+  const constants = [];
+  const dataEnd = pos + dataSize;
+  while (pos < dataEnd) {
+    const len = (bytes[pos] << 24) | (bytes[pos+1] << 16) | (bytes[pos+2] << 8) | bytes[pos+3];
+    pos += 4;
+    if (pos + len > dataEnd) throw new Error('Constant data truncated');
+    
+    let value;
+    if (len === 8) {
+      // Double (IEEE 754 little‑endian)
+      const buf = new ArrayBuffer(8);
+      const view = new DataView(buf);
+      for (let i = 0; i < 8; i++) view.setUint8(i, bytes[pos + i]);
+      value = view.getFloat64(0, true);
+      pos += 8;
+    } else if (len === 1 && bytes[pos] === 0) {
+      value = null;
+      pos += 1;
+    } else if (len === 1 && (bytes[pos] === 0 || bytes[pos] === 1)) {
+      value = bytes[pos] === 1;
+      pos += 1;
+    } else {
+      // String (UTF-8)
+      const strBytes = bytes.slice(pos, pos + len);
+      value = new TextDecoder().decode(new Uint8Array(strBytes));
+      pos += len;
+    }
+    constants.push(value);
+  }
+
+  // Code section
+  const code = bytes.slice(pos, pos + codeSize);
+  const disassembly = [];
+  let i = 0;
+  while (i < code.length) {
+    const op = code[i];
+    const mnemonic = OP_NAME[op] || `UNKNOWN_0x${op.toString(16).padStart(2,'0')}`;
+    let line = `${i.toString(16).padStart(4,'0')}: ${mnemonic}`;
+    i++;
+
+    if (op === 0x01 || op === 0x03 || op === 0x04 || op === 0x21 || op === 0x26 || op === 0x27) {
+      // 4‑byte constant index
+      if (i + 3 >= code.length) throw new Error('Truncated instruction');
+      const idx = (code[i] << 24) | (code[i+1] << 16) | (code[i+2] << 8) | code[i+3];
+      const constVal = constants[idx];
+      line += ` ${idx} (${JSON.stringify(constVal)})`;
+      i += 4;
+    } else if (op === 0x12 || op === 0x13) {
+      // 2‑byte jump offset (signed)
+      if (i + 1 >= code.length) throw new Error('Truncated jump');
+      let offset = (code[i] << 8) | code[i+1];
+      if (offset > 32767) offset -= 65536; // sign‑extend 16‑bit
+      line += ` ${offset} (→${(i+2 + offset).toString(16)})`;
+      i += 2;
+    } else if (op === 0x23 || op === 0x24) {
+      // 4‑byte argument count
+      if (i + 3 >= code.length) throw new Error('Truncated instruction');
+      const arg = (code[i] << 24) | (code[i+1] << 16) | (code[i+2] << 8) | code[i+3];
+      line += ` ${arg}`;
+      i += 4;
+    }
+    disassembly.push(line);
+  }
+
+  return { magic, entry, dataSize, codeSize, constants, disassembly };
 }
 
 // ----------------------------------------------------------------------
@@ -268,7 +358,7 @@ async function supabaseRequest(env, pathSegment, options = {}) {
 }
 
 // ----------------------------------------------------------------------
-//  HTML Templates (unchanged from your original)
+//  HTML Templates (FIXED - no nested backticks!)
 // ----------------------------------------------------------------------
 const LAYOUT_CSS = `
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -409,8 +499,18 @@ const LAYOUT_CSS = `
   }
 `;
 
-const ROOT_HTML = `
-<!DOCTYPE html>
+const TOAST_JS = `
+function showToast(message, type) {
+  if (type === undefined) type = 'success';
+  const toast = document.getElementById('toast');
+  toast.textContent = message;
+  toast.className = 'toast ' + type;
+  toast.style.display = 'block';
+  setTimeout(() => { toast.style.display = 'none'; }, 4000);
+}
+`;
+
+const ROOT_HTML = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
@@ -492,12 +592,10 @@ const ROOT_HTML = `
           showToast('Code generated successfully!');
           
           // Show response details
-          aiResponse.innerHTML = \`
-            <strong>✅ Generated Program</strong>
-            <p>Program ID: \${data.programId}</p>
-            <a href="\${data.publicUrl}" target="_blank" class="btn">View Public</a>
-            <a href="\${data.adminUrl}" target="_blank" class="btn btn-secondary">Admin</a>
-          \`;
+          aiResponse.innerHTML = '<strong>✅ Generated Program</strong>' +
+            '<p>Program ID: ' + data.programId + '</p>' +
+            '<a href="' + data.publicUrl + '" target="_blank" class="btn">View Public</a> ' +
+            '<a href="' + data.adminUrl + '" target="_blank" class="btn btn-secondary">Admin</a>';
           aiResponse.style.display = 'block';
         } else {
           showToast('Error: ' + (data.details || data.error), 'error');
@@ -515,8 +613,8 @@ const ROOT_HTML = `
 
     // Enhance Compiler
     document.getElementById('enhanceCompiler').addEventListener('click', async () => {
-      const prompt = prompt('Describe how you want to enhance the compiler (e.g., "Add support for async/await with better error handling"):');
-      if (!prompt) return;
+      const promptText = prompt('Describe how you want to enhance the compiler (e.g., "Add support for async/await with better error handling"):');
+      if (!promptText) return;
 
       // Get current compiler source (you'd need to fetch this)
       const res = await fetch('/api/compiler/source');
@@ -530,14 +628,13 @@ const ROOT_HTML = `
         const res = await fetch('/api/ai/transform', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt, sourceCode })
+          body: JSON.stringify({ prompt: promptText, sourceCode })
         });
         
         const data = await res.json();
         
         if (res.ok) {
           showToast('Compiler enhanced! Reload to use new features.');
-          // You could save this to a new file or show diff
           console.log('New compiler:', data.transformed);
         } else {
           showToast('Error: ' + data.error, 'error');
@@ -550,7 +647,7 @@ const ROOT_HTML = `
       }
     });
 
-    // Manual creation form (your existing code)
+    // Manual creation form
     document.getElementById('createForm').addEventListener('submit', async (e) => {
       e.preventDefault();
       const btn = document.getElementById('createBtn');
@@ -583,375 +680,14 @@ const ROOT_HTML = `
     });
   </script>
 </body>
-</html>
-`;
+</html>`;
 
-const TOAST_JS = `
-  function showToast(message, type = 'success') {
-    const toast = document.getElementById('toast');
-    toast.textContent = message;
-    toast.className = 'toast ' + type;
-    toast.style.display = 'block';
-    setTimeout(() => { toast.style.display = 'none'; }, 4000);
-  }
-`;
-
-// ----------------------------------------------------------------------
-//  Worker
-// ----------------------------------------------------------------------
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    // CORS preflight
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type',
-        },
-      });
-    }
-
-    // --- AI Endpoints ---
-    if (request.method === 'POST' && path === '/api/ai/transform') {
-      return handleAITransform(request, env);
-    }
-
-    if (request.method === 'POST' && path === '/api/ai/compile') {
-      return handleAIAssistedCompile(request, env);
-    }
-
-    if (request.method === 'GET' && path === '/api/compiler/source') {
-      // Return the current compiler source (you'd need to fetch this from your KV or similar)
-      // This is a placeholder - implement based on your storage
-      return new Response('// Compiler source would be returned here', {
-        headers: { 'Content-Type': 'text/plain' },
-      });
-    }
-
-    // --- CREATE PROGRAM (unchanged from your original) ---
-    if (request.method === 'POST' && path === '/') {
-      try {
-        const body = await request.json().catch(() => ({}));
-        const { source, type = 'program-bot' } = body;
-        if (!source) {
-          return new Response(JSON.stringify({ error: 'Missing source' }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-
-        let binaryBuffer;
-        try {
-          if (type === 'program-bot') {
-            binaryBuffer = compileProgramBot(source);
-          } else if (type === 'network-bots') {
-            binaryBuffer = compileNetworkBots(source);
-          } else {
-            return new Response(JSON.stringify({ error: 'Invalid type' }), {
-              status: 400,
-              headers: { 'Content-Type': 'application/json' },
-            });
-          }
-        } catch (err) {
-          return new Response(JSON.stringify({ error: 'Compilation failed', details: err.message }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-
-        const adminToken = generateAdminToken();
-        const insertRes = await supabaseRequest(env, 'programs', {
-          method: 'POST',
-          headers: { 'Prefer': 'return=representation' },
-          body: JSON.stringify({
-            admin_token: adminToken,
-            source_code: source,
-            binary: bufferToHex(binaryBuffer),
-          }),
-        });
-
-        const newRecord = await insertRes.json();
-        const programId = newRecord[0].id;
-        const baseUrl = `${url.protocol}//${url.host}`;
-        const publicUrl = `${baseUrl}/${programId}`;
-        const adminUrl = `${baseUrl}/admin/${adminToken}`;
-
-        return new Response(JSON.stringify({ publicUrl, adminUrl }), {
-          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-        });
-      } catch (err) {
-        return new Response(JSON.stringify({ error: err.message }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-    }
-
-    // --- PUBLIC VIEW (unchanged from your original) ---
-    const publicMatch = path.match(/^\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
-    if (request.method === 'GET' && publicMatch) {
-      const id = publicMatch[1];
-      try {
-        const res = await supabaseRequest(env, `programs?id=eq.${id}&select=source_code,created_at,updated_at,admin_token`);
-        const data = await res.json();
-        if (!data.length) return new Response('Not found', { status: 404 });
-        const program = data[0];
-        const html = publicViewHTML(id, program);
-        return new Response(html, { headers: { 'Content-Type': 'text/html' } });
-      } catch (err) {
-        return new Response('Error: ' + err.message, { status: 500 });
-      }
-    }
-
-    // --- ADMIN VIEW (unchanged from your original) ---
-    const adminMatch = path.match(/^\/admin\/([A-Za-z0-9_-]+)$/);
-    if (request.method === 'GET' && adminMatch && !path.endsWith('/binary')) {
-      const token = adminMatch[1];
-      try {
-        const res = await supabaseRequest(env, `programs?admin_token=eq.${token}&select=id,source_code,created_at,updated_at`);
-        const data = await res.json();
-        if (!data.length) return new Response('Not found', { status: 404 });
-        const program = data[0];
-        const html = adminViewHTML(program);
-        return new Response(html, { headers: { 'Content-Type': 'text/html' } });
-      } catch (err) {
-        return new Response('Error: ' + err.message, { status: 500 });
-      }
-    }
-
-    // --- ADMIN UPDATE (unchanged from your original) ---
-    if (request.method === 'POST' && adminMatch) {
-      const token = adminMatch[1];
-      try {
-        const body = await request.json().catch(() => ({}));
-        const { source } = body;
-        if (!source) {
-          return new Response(JSON.stringify({ error: 'Missing source' }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        let binaryBuffer;
-        try {
-          binaryBuffer = compileProgramBot(source);
-        } catch (err) {
-          return new Response(JSON.stringify({ error: 'Compilation failed', details: err.message }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        await supabaseRequest(env, `programs?admin_token=eq.${token}`, {
-          method: 'PATCH',
-          body: JSON.stringify({
-            source_code: source,
-            binary: bufferToHex(binaryBuffer),
-            updated_at: new Date().toISOString(),
-          }),
-        });
-        return new Response(JSON.stringify({ success: true }), {
-          headers: { 'Content-Type': 'application/json' },
-        });
-      } catch (err) {
-        return new Response(JSON.stringify({ error: err.message }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-    }
-
-    // --- GET BINARY HEX (unchanged from your original) ---
-    if (request.method === 'GET' && path.match(/^\/admin\/[A-Za-z0-9_-]+\/binary$/)) {
-      const token = path.split('/')[2];
-      try {
-        const res = await supabaseRequest(env, `programs?admin_token=eq.${token}&select=binary`);
-        const data = await res.json();
-        if (!data.length) return new Response('Not found', { status: 404 });
-        const binaryHex = data[0].binary;
-        return new Response(binaryHex, { headers: { 'Content-Type': 'text/plain' } });
-      } catch (err) {
-        return new Response('Error: ' + err.message, { status: 500 });
-      }
-    }
-
-    // --- DECOMPILE FORM (GET) ---
-    if (request.method === 'GET' && path === '/decompile') {
-      return new Response(DECOMPILE_FORM_HTML, { headers: { 'Content-Type': 'text/html' } });
-    }
-
-    // --- DECOMPILE RESULT (POST) ---
-    if (request.method === 'POST' && path === '/decompile') {
-      const contentType = request.headers.get('content-type') || '';
-      let binaryHex = '';
-      if (contentType.includes('application/x-www-form-urlencoded')) {
-        const formData = await request.formData();
-        binaryHex = formData.get('binary') || '';
-      } else if (contentType.includes('application/json')) {
-        const body = await request.json().catch(() => ({}));
-        binaryHex = body.binary || '';
-      } else {
-        binaryHex = await request.text(); // fallback
-      }
-      if (!binaryHex.trim()) {
-        return new Response('Missing binary input', { status: 400 });
-      }
-      const html = decompileResultHTML(binaryHex);
-      return new Response(html, { headers: { 'Content-Type': 'text/html' } });
-    }
-
-    // --- ROOT (AI-Enhanced) ---
-    if (request.method === 'GET' && path === '/') {
-      return new Response(ROOT_HTML, { headers: { 'Content-Type': 'text/html' } });
-    }
-
-    return new Response('Not found', { status: 404 });
-  },
-};
-
-// Keep your existing helper functions (publicViewHTML, adminViewHTML, decompileResultHTML, etc.)
-function publicViewHTML(id, program) {
-  return \`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>Program \${id}</title>
-  <style>\${LAYOUT_CSS}</style>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-</head>
-<body>
-  <div class="card">
-    <h1>📄 Program \${id}</h1>
-    <div class="meta">
-      <span>📅 Created: \${new Date(program.created_at).toLocaleString()}</span>
-      <span>🕒 Updated: \${new Date(program.updated_at).toLocaleString()}</span>
-    </div>
-    <h2>Source Code</h2>
-    <pre><code class="language-javascript" style="background: #0d1117; border-radius: 8px;">\${escapeHtml(program.source_code)}</code></pre>
-    <p style="margin-top: 2rem;">
-      <a href="/admin/\${program.admin_token}" target="_blank" class="btn">🔐 Admin (edit)</a> 
-      <span style="color: #8b949e; margin-left: 1rem;">– keep this link secret.</span>
-    </p>
-    <script>hljs.highlightAll();</script>
-  </div>
-</body>
-</html>\`;
-}
-
-function adminViewHTML(program) {
-  return \`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>Edit Program</title>
-  <style>\${LAYOUT_CSS}</style>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/codemirror.min.css">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/theme/dracula.min.css">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/codemirror.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/mode/javascript/javascript.min.js"></script>
-</head>
-<body>
-  <div id="toast" class="toast"></div>
-  <div class="card">
-    <h1>✏️ Edit Program</h1>
-    <div class="meta">
-      <span>ID: \${program.id}</span>
-      <span>Created: \${new Date(program.created_at).toLocaleString()}</span>
-      <span>Updated: \${new Date(program.updated_at).toLocaleString()}</span>
-    </div>
-    <textarea id="source-textarea" style="display:none;">\${escapeHtml(program.source_code)}</textarea>
-    <div class="editor-container">
-      <div id="editor"></div>
-    </div>
-    <div style="display: flex; align-items: center; gap: 1rem; margin: 1.5rem 0;">
-      <button id="saveBtn" class="btn">💾 Save & Recompile</button>
-      <button id="viewBinaryBtn" class="btn btn-secondary">🔍 View Binary (hex)</button>
-      <div id="spinner" class="spinner" style="display:none;"></div>
-    </div>
-    <div id="binary-panel" class="binary-panel" style="display:none;"></div>
-  </div>
-  <script>
-    \${TOAST_JS}
-    const sourceTextarea = document.getElementById('source-textarea');
-    const editor = document.getElementById('editor');
-    const cm = CodeMirror(editor, {
-      lineNumbers: true,
-      mode: 'javascript',
-      theme: 'dracula',
-      value: sourceTextarea.value,
-      lineWrapping: true,
-      indentUnit: 2,
-      tabSize: 2
-    });
-
-    const saveBtn = document.getElementById('saveBtn');
-    const spinner = document.getElementById('spinner');
-    const binaryPanel = document.getElementById('binary-panel');
-
-    async function fetchBinary() {
-      const res = await fetch(window.location.href + '/binary');
-      if (res.ok) {
-        const hex = await res.text();
-        const formatted = formatHex(hex);
-        binaryPanel.style.display = 'block';
-        binaryPanel.textContent = formatted;
-      } else {
-        showToast('Could not load binary', 'error');
-      }
-    }
-
-    function formatHex(hexString) {
-      const hex = hexString.startsWith('\\\\\\\\x') ? hexString.slice(2) : hexString;
-      const pairs = hex.match(/.{1,2}/g) || [];
-      const lines = [];
-      for (let i = 0; i < pairs.length; i += 16) {
-        lines.push(pairs.slice(i, i + 16).join(' '));
-      }
-      return lines.join('\\\\n');
-    }
-
-    document.getElementById('viewBinaryBtn').addEventListener('click', fetchBinary);
-
-    saveBtn.addEventListener('click', async () => {
-      const source = cm.getValue();
-      saveBtn.disabled = true;
-      spinner.style.display = 'inline-block';
-
-      try {
-        const res = await fetch(window.location.href, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ source })
-        });
-        if (res.ok) {
-          showToast('Program saved and recompiled.');
-          if (binaryPanel.style.display === 'block') await fetchBinary();
-        } else {
-          const err = await res.json();
-          showToast('Error: ' + (err.details || err.error), 'error');
-        }
-      } catch (err) {
-        showToast('Network error: ' + err.message, 'error');
-      } finally {
-        saveBtn.disabled = false;
-        spinner.style.display = 'none';
-      }
-    });
-  </script>
-</body>
-</html>\`;
-}
-
-const DECOMPILE_FORM_HTML = \`
-<!DOCTYPE html>
+const DECOMPILE_FORM_HTML = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
   <title>WEB_PROGRAMS – Decompile Binary</title>
-  <style>\${LAYOUT_CSS}</style>
+  <style>${LAYOUT_CSS}</style>
 </head>
 <body>
   <div id="toast" class="toast"></div>
@@ -969,7 +705,7 @@ const DECOMPILE_FORM_HTML = \`
     </form>
   </div>
   <script>
-    \${TOAST_JS}
+    ${TOAST_JS}
     document.getElementById('decompileForm').addEventListener('submit', async (e) => {
       e.preventDefault();
       const btn = document.getElementById('decompileBtn');
@@ -1003,8 +739,140 @@ const DECOMPILE_FORM_HTML = \`
     });
   </script>
 </body>
-</html>
-\`;
+</html>`;
+
+function publicViewHTML(id, program) {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Program ${id}</title>
+  <style>${LAYOUT_CSS}</style>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+</head>
+<body>
+  <div class="card">
+    <h1>📄 Program ${id}</h1>
+    <div class="meta">
+      <span>📅 Created: ${new Date(program.created_at).toLocaleString()}</span>
+      <span>🕒 Updated: ${new Date(program.updated_at).toLocaleString()}</span>
+    </div>
+    <h2>Source Code</h2>
+    <pre><code class="language-javascript" style="background: #0d1117; border-radius: 8px;">${escapeHtml(program.source_code)}</code></pre>
+    <p style="margin-top: 2rem;">
+      <a href="/admin/${program.admin_token}" target="_blank" class="btn">🔐 Admin (edit)</a> 
+      <span style="color: #8b949e; margin-left: 1rem;">– keep this link secret.</span>
+    </p>
+    <script>hljs.highlightAll();</script>
+  </div>
+</body>
+</html>`;
+}
+
+function adminViewHTML(program) {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Edit Program</title>
+  <style>${LAYOUT_CSS}</style>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/codemirror.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/theme/dracula.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/codemirror.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/mode/javascript/javascript.min.js"></script>
+</head>
+<body>
+  <div id="toast" class="toast"></div>
+  <div class="card">
+    <h1>✏️ Edit Program</h1>
+    <div class="meta">
+      <span>ID: ${program.id}</span>
+      <span>Created: ${new Date(program.created_at).toLocaleString()}</span>
+      <span>Updated: ${new Date(program.updated_at).toLocaleString()}</span>
+    </div>
+    <textarea id="source-textarea" style="display:none;">${escapeHtml(program.source_code)}</textarea>
+    <div class="editor-container">
+      <div id="editor"></div>
+    </div>
+    <div style="display: flex; align-items: center; gap: 1rem; margin: 1.5rem 0;">
+      <button id="saveBtn" class="btn">💾 Save & Recompile</button>
+      <button id="viewBinaryBtn" class="btn btn-secondary">🔍 View Binary (hex)</button>
+      <div id="spinner" class="spinner" style="display:none;"></div>
+    </div>
+    <div id="binary-panel" class="binary-panel" style="display:none;"></div>
+  </div>
+  <script>
+    ${TOAST_JS}
+    const sourceTextarea = document.getElementById('source-textarea');
+    const editor = document.getElementById('editor');
+    const cm = CodeMirror(editor, {
+      lineNumbers: true,
+      mode: 'javascript',
+      theme: 'dracula',
+      value: sourceTextarea.value,
+      lineWrapping: true,
+      indentUnit: 2,
+      tabSize: 2
+    });
+
+    const saveBtn = document.getElementById('saveBtn');
+    const spinner = document.getElementById('spinner');
+    const binaryPanel = document.getElementById('binary-panel');
+
+    async function fetchBinary() {
+      const res = await fetch(window.location.href + '/binary');
+      if (res.ok) {
+        const hex = await res.text();
+        const formatted = formatHex(hex);
+        binaryPanel.style.display = 'block';
+        binaryPanel.textContent = formatted;
+      } else {
+        showToast('Could not load binary', 'error');
+      }
+    }
+
+    function formatHex(hexString) {
+      const hex = hexString.startsWith('\\\\x') ? hexString.slice(2) : hexString;
+      const pairs = hex.match(/.{1,2}/g) || [];
+      const lines = [];
+      for (let i = 0; i < pairs.length; i += 16) {
+        lines.push(pairs.slice(i, i + 16).join(' '));
+      }
+      return lines.join('\\n');
+    }
+
+    document.getElementById('viewBinaryBtn').addEventListener('click', fetchBinary);
+
+    saveBtn.addEventListener('click', async () => {
+      const source = cm.getValue();
+      saveBtn.disabled = true;
+      spinner.style.display = 'inline-block';
+
+      try {
+        const res = await fetch(window.location.href, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source })
+        });
+        if (res.ok) {
+          showToast('Program saved and recompiled.');
+          if (binaryPanel.style.display === 'block') await fetchBinary();
+        } else {
+          const err = await res.json();
+          showToast('Error: ' + (err.details || err.error), 'error');
+        }
+      } catch (err) {
+        showToast('Network error: ' + err.message, 'error');
+      } finally {
+        saveBtn.disabled = false;
+        spinner.style.display = 'none';
+      }
+    });
+  </script>
+</body>
+</html>`;
+}
 
 function decompileResultHTML(hexInput) {
   try {
@@ -1014,17 +882,17 @@ function decompileResultHTML(hexInput) {
     const disasmHtml = disassembly.map(line => {
       const escaped = escapeHtml(line);
       // Colour address, mnemonic, and arguments
-      const coloured = escaped.replace(/^([0-9a-f]{4}):\\s+([A-Z_]+)(.*)$/, 
+      const coloured = escaped.replace(/^([0-9a-f]{4}):\s+([A-Z_]+)(.*)$/, 
         '<span class="addr">$1:</span> <span class="opcode">$2</span><span class="data">$3</span>');
-      return `<div class="disasm-line">\${coloured}</div>`;
+      return '<div class="disasm-line">' + coloured + '</div>';
     }).join('');
 
-    return \`<!DOCTYPE html>
+    return `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
   <title>Decompiled Program</title>
-  <style>\${LAYOUT_CSS}</style>
+  <style>${LAYOUT_CSS}</style>
   <style>
     .disasm-line { 
       font-family: 'JetBrains Mono', monospace; 
@@ -1088,45 +956,45 @@ function decompileResultHTML(hexInput) {
   <div class="card">
     <h1 style="display: flex; align-items: center; gap: 1rem;">
       <span>🔍 Program Disassembly</span>
-      <span style="font-size: 0.8rem; background: #1f1f1f; padding: 0.3rem 0.8rem; border-radius: 20px;">\${magic}</span>
+      <span style="font-size: 0.8rem; background: #1f1f1f; padding: 0.3rem 0.8rem; border-radius: 20px;">${magic}</span>
     </h1>
 
     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin: 2rem 0;">
       <div class="stat-card" style="background: #1f1f1f; border-radius: 12px; padding: 1rem;">
         <div style="color: #8b949e; font-size: 0.8rem;">Entry Point</div>
-        <div style="font-size: 1.5rem; font-weight: bold; color: #79c0ff;">\${entry}</div>
+        <div style="font-size: 1.5rem; font-weight: bold; color: #79c0ff;">${entry}</div>
       </div>
       <div class="stat-card" style="background: #1f1f1f; border-radius: 12px; padding: 1rem;">
         <div style="color: #8b949e; font-size: 0.8rem;">Data Size</div>
-        <div style="font-size: 1.5rem; font-weight: bold; color: #7ee787;">\${dataSize} bytes</div>
+        <div style="font-size: 1.5rem; font-weight: bold; color: #7ee787;">${dataSize} bytes</div>
       </div>
       <div class="stat-card" style="background: #1f1f1f; border-radius: 12px; padding: 1rem;">
         <div style="color: #8b949e; font-size: 0.8rem;">Code Size</div>
-        <div style="font-size: 1.5rem; font-weight: bold; color: #ff7b72;">\${codeSize} bytes</div>
+        <div style="font-size: 1.5rem; font-weight: bold; color: #ff7b72;">${codeSize} bytes</div>
       </div>
     </div>
 
-    <div class="section-header" onclick="toggleSection('constants')">Constants (\${constants.length})</div>
+    <div class="section-header" onclick="toggleSection('constants')">Constants (${constants.length})</div>
     <div id="constants" class="section-content">
       <table class="constants-table">
         <thead><tr><th>Index</th><th>Value</th><th>Type</th></tr></thead>
         <tbody>
-          \${constants.map((v, idx) => {
+          ${constants.map((v, idx) => {
             let type = typeof v;
             if (v === null) type = 'null';
             else if (Array.isArray(v)) type = 'array';
             else if (type === 'object') type = 'object';
             const display = escapeHtml(JSON.stringify(v));
-            return `<tr><td>\${idx}</td><td>\${display}</td><td><span class="type-tag">\${type}</span></td></tr>`;
+            return '<tr><td>' + idx + '</td><td>' + display + '</td><td><span class="type-tag">' + type + '</span></td></tr>';
           }).join('')}
         </tbody>
       </table>
     </div>
 
-    <div class="section-header" onclick="toggleSection('disasm')">Disassembly (\${disassembly.length} instructions)</div>
+    <div class="section-header" onclick="toggleSection('disasm')">Disassembly (${disassembly.length} instructions)</div>
     <div id="disasm" class="section-content">
       <div class="binary-panel" style="white-space: pre; font-family: 'JetBrains Mono', monospace; max-height: 500px; overflow-y: auto;">
-        \${disasmHtml}
+        ${disasmHtml}
       </div>
     </div>
 
@@ -1149,12 +1017,226 @@ function decompileResultHTML(hexInput) {
     document.querySelector('.section-header').classList.add('collapsed');
   </script>
 </body>
-</html>\`;
+</html>`;
   } catch (err) {
-    return \`<!DOCTYPE html>
+    return `<!DOCTYPE html>
 <html>
-<head><meta charset="UTF-8"><title>Error</title><style>\${LAYOUT_CSS}</style></head>
-<body><div class="card"><h1>❌ Decompilation Failed</h1><p>\${escapeHtml(err.message)}</p><p><a href="/decompile" class="btn">← Try Again</a></p></div></body>
-</html>\`;
+<head><meta charset="UTF-8"><title>Error</title><style>${LAYOUT_CSS}</style></head>
+<body><div class="card"><h1>❌ Decompilation Failed</h1><p>${escapeHtml(err.message)}</p><p><a href="/decompile" class="btn">← Try Again</a></p></div></body>
+</html>`;
   }
 }
+
+// ----------------------------------------------------------------------
+//  Worker
+// ----------------------------------------------------------------------
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type',
+        },
+      });
+    }
+
+    // --- AI Endpoints ---
+    if (request.method === 'POST' && path === '/api/ai/transform') {
+      return handleAITransform(request, env);
+    }
+
+    if (request.method === 'POST' && path === '/api/ai/compile') {
+      return handleAIAssistedCompile(request, env);
+    }
+
+    if (request.method === 'GET' && path === '/api/compiler/source') {
+      // Return the current compiler source (you'd need to fetch this from your KV or similar)
+      return new Response('// Compiler source would be returned here', {
+        headers: { 'Content-Type': 'text/plain' },
+      });
+    }
+
+    // --- CREATE PROGRAM ---
+    if (request.method === 'POST' && path === '/') {
+      try {
+        const body = await request.json().catch(() => ({}));
+        const { source, type = 'program-bot' } = body;
+        if (!source) {
+          return new Response(JSON.stringify({ error: 'Missing source' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+
+        let binaryBuffer;
+        try {
+          if (type === 'program-bot') {
+            binaryBuffer = compileProgramBot(source);
+          } else if (type === 'network-bots') {
+            binaryBuffer = compileNetworkBots(source);
+          } else {
+            return new Response(JSON.stringify({ error: 'Invalid type' }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+        } catch (err) {
+          return new Response(JSON.stringify({ error: 'Compilation failed', details: err.message }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+
+        const adminToken = generateAdminToken();
+        const insertRes = await supabaseRequest(env, 'programs', {
+          method: 'POST',
+          headers: { 'Prefer': 'return=representation' },
+          body: JSON.stringify({
+            admin_token: adminToken,
+            source_code: source,
+            binary: bufferToHex(binaryBuffer),
+          }),
+        });
+
+        const newRecord = await insertRes.json();
+        const programId = newRecord[0].id;
+        const baseUrl = `${url.protocol}//${url.host}`;
+        const publicUrl = `${baseUrl}/${programId}`;
+        const adminUrl = `${baseUrl}/admin/${adminToken}`;
+
+        return new Response(JSON.stringify({ publicUrl, adminUrl }), {
+          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    // --- PUBLIC VIEW ---
+    const publicMatch = path.match(/^\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+    if (request.method === 'GET' && publicMatch) {
+      const id = publicMatch[1];
+      try {
+        const res = await supabaseRequest(env, `programs?id=eq.${id}&select=source_code,created_at,updated_at,admin_token`);
+        const data = await res.json();
+        if (!data.length) return new Response('Not found', { status: 404 });
+        const program = data[0];
+        const html = publicViewHTML(id, program);
+        return new Response(html, { headers: { 'Content-Type': 'text/html' } });
+      } catch (err) {
+        return new Response('Error: ' + err.message, { status: 500 });
+      }
+    }
+
+    // --- ADMIN VIEW ---
+    const adminMatch = path.match(/^\/admin\/([A-Za-z0-9_-]+)$/);
+    if (request.method === 'GET' && adminMatch && !path.endsWith('/binary')) {
+      const token = adminMatch[1];
+      try {
+        const res = await supabaseRequest(env, `programs?admin_token=eq.${token}&select=id,source_code,created_at,updated_at`);
+        const data = await res.json();
+        if (!data.length) return new Response('Not found', { status: 404 });
+        const program = data[0];
+        const html = adminViewHTML(program);
+        return new Response(html, { headers: { 'Content-Type': 'text/html' } });
+      } catch (err) {
+        return new Response('Error: ' + err.message, { status: 500 });
+      }
+    }
+
+    // --- ADMIN UPDATE ---
+    if (request.method === 'POST' && adminMatch) {
+      const token = adminMatch[1];
+      try {
+        const body = await request.json().catch(() => ({}));
+        const { source } = body;
+        if (!source) {
+          return new Response(JSON.stringify({ error: 'Missing source' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        let binaryBuffer;
+        try {
+          binaryBuffer = compileProgramBot(source);
+        } catch (err) {
+          return new Response(JSON.stringify({ error: 'Compilation failed', details: err.message }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        await supabaseRequest(env, `programs?admin_token=eq.${token}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            source_code: source,
+            binary: bufferToHex(binaryBuffer),
+            updated_at: new Date().toISOString(),
+          }),
+        });
+        return new Response(JSON.stringify({ success: true }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    // --- GET BINARY HEX ---
+    if (request.method === 'GET' && path.match(/^\/admin\/[A-Za-z0-9_-]+\/binary$/)) {
+      const token = path.split('/')[2];
+      try {
+        const res = await supabaseRequest(env, `programs?admin_token=eq.${token}&select=binary`);
+        const data = await res.json();
+        if (!data.length) return new Response('Not found', { status: 404 });
+        const binaryHex = data[0].binary;
+        return new Response(binaryHex, { headers: { 'Content-Type': 'text/plain' } });
+      } catch (err) {
+        return new Response('Error: ' + err.message, { status: 500 });
+      }
+    }
+
+    // --- DECOMPILE FORM (GET) ---
+    if (request.method === 'GET' && path === '/decompile') {
+      return new Response(DECOMPILE_FORM_HTML, { headers: { 'Content-Type': 'text/html' } });
+    }
+
+    // --- DECOMPILE RESULT (POST) ---
+    if (request.method === 'POST' && path === '/decompile') {
+      const contentType = request.headers.get('content-type') || '';
+      let binaryHex = '';
+      if (contentType.includes('application/x-www-form-urlencoded')) {
+        const formData = await request.formData();
+        binaryHex = formData.get('binary') || '';
+      } else if (contentType.includes('application/json')) {
+        const body = await request.json().catch(() => ({}));
+        binaryHex = body.binary || '';
+      } else {
+        binaryHex = await request.text();
+      }
+      if (!binaryHex.trim()) {
+        return new Response('Missing binary input', { status: 400 });
+      }
+      const html = decompileResultHTML(binaryHex);
+      return new Response(html, { headers: { 'Content-Type': 'text/html' } });
+    }
+
+    // --- ROOT (AI-Enhanced) ---
+    if (request.method === 'GET' && path === '/') {
+      return new Response(ROOT_HTML, { headers: { 'Content-Type': 'text/html' } });
+    }
+
+    return new Response('Not found', { status: 404 });
+  },
+};
