@@ -2,6 +2,9 @@ name = "web-programs"
 main = "src/index.js"
 compatibility_date = "2025-02-13"
 
+[ai]
+binding = "AI"
+
 [vars]
 SUPABASE_URL = "https://vtdakdiebugurbboniex.supabase.co"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ0ZGFrZGllYnVndXJiYm9uaWV4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE0NzI5MDQsImV4cCI6MjA3NzA0ODkwNH0.j6mLhZKuuY-EgZbkZsQ-uUtYXugHOyW2lwD4WYtAaDs"
