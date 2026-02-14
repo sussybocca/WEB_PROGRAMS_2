@@ -1,4 +1,4 @@
-name = "web-programs"
+name = "webprograms"
 main = "src/index.js"
 compatibility_date = "2025-02-13"
 
